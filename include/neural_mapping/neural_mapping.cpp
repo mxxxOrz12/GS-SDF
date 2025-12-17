@@ -76,7 +76,7 @@ DepthSamples NeuralSLAM::sample(DepthSamples _ray_samples,
   _ray_samples.ridx = torch::arange(_ray_samples.size(0), k_device);
   _ray_samples.ray_sdf = torch::zeros({_ray_samples.size(0), 1}, k_device);
   
-】  DepthSamples point_samples = local_map_ptr->sample(_ray_samples, 1, _sample_free);
+   DepthSamples point_samples = local_map_ptr->sample(_ray_samples, 1, _sample_free);
 
   auto surface_samples =
       utils::sample_surface_pts(_ray_samples, k_surface_sample_num, sample_std);
