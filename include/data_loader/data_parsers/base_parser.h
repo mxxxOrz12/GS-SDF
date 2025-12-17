@@ -75,6 +75,11 @@ struct DataParser {
 
   torch::Device device_ = torch::kCPU;
   torch::Tensor train_color_;                                   // [N, H, W, 3]
+
+  torch::Tensor train_normal_;                                 // [N, 3, H, W]
+  std::vector<std::filesystem::path> raw_normal_filelists_; //  存储法线文件路径
+
+
   DepthSamples train_depth_pack_;                               // [N]
   torch::Tensor depth_poses_, train_depth_poses_, color_poses_; // [N, 3, 4]
 

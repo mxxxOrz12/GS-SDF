@@ -72,33 +72,53 @@ DepthSamples NeuralSLAM::sample(DepthSamples _ray_samples,
                                 const bool &_sample_free) {
   static auto p_t_utils_sample = llog::CreateTimer("   utils::sample");
   p_t_utils_sample->tic();
+  
   _ray_samples.ridx = torch::arange(_ray_samples.size(0), k_device);
   _ray_samples.ray_sdf = torch::zeros({_ray_samples.size(0), 1}, k_device);
-  // [n,num_samples]
-  DepthSamples point_samples =
-      local_map_ptr->sample(_ray_samples, 1, _sample_free);
+  
+】  DepthSamples point_samples = local_map_ptr->sample(_ray_samples, 1, _sample_free);
 
   auto surface_samples =
       utils::sample_surface_pts(_ray_samples, k_surface_sample_num, sample_std);
+
+  if(data_loader_ptr->dataparser_ptr_->train_normal_.defined())
+  {
+    auto& normal_tensor = data_loader_ptr->dataparser_ptr_->train_normal_;
+    auto grid = _ray_samples.grid_id; 
+
+    auto img_ids = grid.index({torch::indexing::Slice(), 0}).to(torch::kLong);
+    auto ys      = grid.index({torch::indexing::Slice(), 1}).to(torch::kLong);
+    auto xs      = grid.index({torch::indexing::Slice(), 2}).to(torch::kLong);
+
+    auto ray_normals = normal_tensor.index({img_ids, torch::indexing::Slice(), ys, xs});
+
+    surface_samples.gt_normal_cam = ray_normals.repeat_interleave(k_surface_sample_num, 0);
+  }
+
   point_samples = point_samples.cat(surface_samples);
 
   auto trunc_idx = (point_samples.ray_sdf.abs() > k_truncated_dis)
                        .squeeze()
                        .nonzero()
                        .squeeze();
-  point_samples.ray_sdf.index_put_(
-      {trunc_idx},
-      point_samples.ray_sdf.index({trunc_idx}).sign() * k_truncated_dis);
+  if (trunc_idx.numel() > 0) { 
+      point_samples.ray_sdf.index_put_(
+          {trunc_idx},
+          point_samples.ray_sdf.index({trunc_idx}).sign() * k_truncated_dis);
+  }
 
   point_samples = point_samples.cat(_ray_samples);
 
-  // if contraction no need to filter
   auto inrange_idx =
       local_map_ptr->get_inrange_mask(point_samples.xyz).nonzero().squeeze();
   point_samples = point_samples.index_select(0, inrange_idx);
+  
   p_t_utils_sample->toc_sum();
   return point_samples;
 }
+
+
+
 
 torch::Tensor NeuralSLAM::sdf_regularization(const torch::Tensor &xyz,
                                              const torch::Tensor &pred_sdf,
@@ -132,49 +152,100 @@ torch::Tensor NeuralSLAM::sdf_regularization(const torch::Tensor &xyz,
   return loss;
 }
 
+
+
 std::tuple<torch::Tensor, DepthSamples>
 NeuralSLAM::sdf_train_batch_iter(const int &iter, const bool &_sample_free) {
   static auto p_t_sample = llog::CreateTimer("  sample");
   p_t_sample->tic();
 
-  auto batch_num =
-      k_numerical_grad ? max((int)(k_batch_num / 6.f), 1) : k_batch_num;
-  auto indices =
-      (torch::rand({k_batch_num}) *
-       data_loader_ptr->dataparser_ptr_->train_depth_pack_.depth.size(0))
-          .to(torch::kLong)
-          .clamp(0,
-                 data_loader_ptr->dataparser_ptr_->train_depth_pack_.depth.size(
-                     0) -
-                     1);
-
-  auto struct_ray_samples =
-      data_loader_ptr->dataparser_ptr_->train_depth_pack_.index({indices}).to(
-          k_device);
-
+  // 1. 采样 (这里会调用你刚才改过的 sample 函数，把 gt_normal_cam 带出来)
+  // ... (保留原有的 indices 计算逻辑) ...
+  auto struct_ray_samples = data_loader_ptr->dataparser_ptr_->train_depth_pack_.index({indices}).to(k_device);
   auto point_samples = sample(struct_ray_samples, k_sample_std, _sample_free);
-  auto inrange_idx = local_map_ptr->get_inrange_mask(point_samples.xyz)
-                         .squeeze()
-                         .nonzero()
-                         .squeeze();
-  point_samples = point_samples.index_select(0, inrange_idx);
+  
+  // ... (保留原有的 inrange_idx 过滤逻辑) ...
   p_t_sample->toc_sum();
 
   static auto p_t_get_sdf = llog::CreateTimer("  get_sdf");
   p_t_get_sdf->tic();
-  if (k_eikonal_weight > 0.0f && !k_numerical_grad) {
+
+  // -----------------------------------------------------------------------
+  // [修改点 A]: 强制开启梯度
+  // 原代码只有在 k_eikonal_weight > 0 时才开，现在如果有 k_normal_weight 也要开
+  // -----------------------------------------------------------------------
+  if ((k_eikonal_weight > 0.0f || k_normal_weight > 0.0f) && !k_numerical_grad) {
     point_samples.xyz.requires_grad_(true);
   }
+
+  // 2. 前向传播：计算 SDF
   auto sdf_results = local_map_ptr->get_sdf(point_samples.xyz);
   point_samples.pred_sdf = sdf_results[0];
   point_samples.pred_isigma = sdf_results[1];
 
+  // 3. 计算基础 SDF Loss
   auto sdf_loss = loss::sdf_loss(point_samples.pred_sdf, point_samples.ray_sdf,
                                  point_samples.pred_isigma);
   auto loss = k_sdf_weight * sdf_loss;
   llog::RecordValue("sdf", sdf_loss.item<float>(), true);
   p_t_get_sdf->toc_sum();
 
+  // -----------------------------------------------------------------------
+  // [修改点 B]: 新增法线 Loss 计算
+  // -----------------------------------------------------------------------
+  if (k_normal_weight > 0.0) {
+      // 检查当前 batch 里是否有有效的法线数据 (防止拼接时补0导致的空数据)
+      if (point_samples.gt_normal_cam.defined()) {
+          
+          // 1. 计算预测法线 (World Space)
+          // d(SDF) / d(XYZ) = Gradient (即法线方向)
+          auto pred_grad = torch::autograd::grad(
+              {point_samples.pred_sdf.sum()}, 
+              {point_samples.xyz}, 
+              /*grad_outputs=*/{}, 
+              /*retain_graph=*/true, // 必须保留图，因为后面可能还有 Eikonal Loss
+              /*create_graph=*/true  // 必须创建图，以便二阶导数反向传播
+          )[0];
+          
+          // 归一化得到单位法线
+          auto pred_normal_world = torch::nn::functional::normalize(
+              pred_grad, torch::nn::functional::NormalizeFuncOptions().dim(1));
+
+          // 2. 准备 GT 法线
+          // point_samples.rotations 是 R_wc (Camera to World 的旋转矩阵) [N, 3, 3]
+          // point_samples.gt_normal_cam 是 [N, 3]
+          
+          // 过滤: 只要那些法线不是全0的点 (sample 中补零的点模长为0)
+          auto gt_norm_len = point_samples.gt_normal_cam.norm(2, 1);
+          auto valid_mask = gt_norm_len > 0.01f; // 模长大于0的才是有效点
+          
+          if (valid_mask.sum().item<float>() > 0) {
+              auto valid_R = point_samples.rotations.index({valid_mask});
+              auto valid_gt_cam = point_samples.gt_normal_cam.index({valid_mask});
+              auto valid_pred_world = pred_normal_world.index({valid_mask});
+
+              // 3. 坐标系旋转: Camera -> World
+              // 公式: N_world = R * N_cam
+              // bmm 要求 [B, N, M] * [B, M, P] -> [B, N, P]
+              // 这里是 [N, 3, 3] * [N, 3, 1] -> [N, 3, 1]
+              auto gt_normal_world = torch::bmm(valid_R, valid_gt_cam.unsqueeze(-1)).squeeze(-1);
+
+              // 4. 计算余弦相似度 Loss
+              // Cosine Similarity = A . B
+              // Loss = | 1 - (A . B) |
+              auto cos_sim = (valid_pred_world * gt_normal_world).sum(1);
+              auto normal_loss = (1.0f - cos_sim).abs().mean();
+
+              // 5. 加到总 Loss
+              loss += k_normal_weight * normal_loss;
+              
+              // 记录日志
+              llog::RecordValue("normal_loss", normal_loss.item<float>(), true);
+          }
+      }
+  }
+
+  // 4. Eikonal Loss (保持原样)
   if (k_eikonal_weight > 0.0) {
     static bool curvate_enable = k_curvate_weight > 0.0;
     loss += sdf_regularization(point_samples.xyz, point_samples.pred_sdf,

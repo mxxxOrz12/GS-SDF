@@ -386,6 +386,19 @@ void read_base_params(const std::filesystem::path &_base_config_path,
     }
     fsSettings["visible_thr"] >> k_visible_thr;
   }
+
+  if(!fsSettings["normal_weight"].isNone())
+  {
+    fsSettings["normal_weight"] >> k_normal_weight;
+  }
+  else{ 
+    k_normal_weight = 0.0f;
+  }
+  std::cout<<"k_normal_weight: "<<k_normal_weight<<std::endl;
+
+
+
+
   fsSettings["rgb_weight"] >> k_rgb_weight;
   fsSettings["dssim_weight"] >> k_dssim_weight;
   fsSettings["render_normal_weight"] >> k_render_normal_weight;

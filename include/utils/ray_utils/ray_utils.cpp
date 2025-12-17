@@ -114,6 +114,7 @@ DepthSamples DepthSamples::index(
       depth.numel() > 0 ? depth.index(index) : torch::Tensor(),
 
       ray_sdf.numel() > 0 ? ray_sdf.index(index) : torch::Tensor(),
+      gt_normal_cam.numel() > 0 ? gt_normal_cam.index(index) : torch::Tensor()
   };
 }
 
@@ -124,7 +125,9 @@ DepthSamples DepthSamples::index_select(const int64_t dim,
           depth.numel() > 0 ? depth.index_select(dim, index) : torch::Tensor(),
 
           ray_sdf.numel() > 0 ? ray_sdf.index_select(dim, index)
-                              : torch::Tensor()};
+                              : torch::Tensor(),
+          gt_normal_cam.numel() > 0 ? gt_normal_cam.index_select(dim, index)
+                                    : torch::Tensor()};
 }
 
 DepthSamples DepthSamples::slice(int64_t dim, c10::optional<int64_t> start,
@@ -136,17 +139,38 @@ DepthSamples DepthSamples::slice(int64_t dim, c10::optional<int64_t> start,
                             : torch::Tensor(),
 
           ray_sdf.numel() > 0 ? ray_sdf.slice(dim, start, end, step)
-                              : torch::Tensor()};
+                              : torch::Tensor(),
+          gt_normal_cam.numel() > 0 ? gt_normal_cam.slice(dim, start, end, step)
+                                    : torch::Tensor()};
 }
 
 DepthSamples DepthSamples::cat(const DepthSamples &other) const {
+  torch::Tensor cat_normal;
+  bool has_this = gt_normal_cam.defined() && gt_normal_cam.numel() > 0;
+  bool has_other = other.gt_normal_cam.defined() && other.gt_normal_cam.numel() > 0;
+
+  if (has_this && has_other) {
+    // 两边都有 -> 直接拼
+    cat_normal = torch::cat({gt_normal_cam, other.gt_normal_cam}, 0);
+  } else if (has_this && !has_other) {
+    // 我有，对方没有 -> 给对方补0
+    // 注意：other.xyz 应该是存在的，用它的 shape[0] 来确定补多少行
+    auto zeros = torch::zeros({other.xyz.size(0), 3}, gt_normal_cam.options());
+    cat_normal = torch::cat({gt_normal_cam, zeros}, 0);
+  } else if (!has_this && has_other) {
+    // 我没有，对方有 -> 给我补0
+    auto zeros = torch::zeros({xyz.size(0), 3}, other.gt_normal_cam.options());
+    cat_normal = torch::cat({zeros, other.gt_normal_cam}, 0);
+  }
+  // 此时如果两个都没有，cat_normal 就是 undefined，符合预期
+
   return {RaySamples::cat(other),
           xyz.numel() > 0 ? torch::cat({xyz, other.xyz}, 0) : torch::Tensor(),
-          depth.numel() > 0 ? torch::cat({depth, other.depth}, 0)
-                            : torch::Tensor(),
-
-          ray_sdf.numel() > 0 ? torch::cat({ray_sdf, other.ray_sdf}, 0)
-                              : torch::Tensor()};
+          depth.numel() > 0 ? torch::cat({depth, other.depth}, 0) : torch::Tensor(),
+          ray_sdf.numel() > 0 ? torch::cat({ray_sdf, other.ray_sdf}, 0) : torch::Tensor(),
+          // [新增]
+          cat_normal
+  };
 }
 
 DepthSamples DepthSamples::to(const torch::TensorOptions &option) const {
@@ -154,7 +178,8 @@ DepthSamples DepthSamples::to(const torch::TensorOptions &option) const {
           xyz.numel() > 0 ? xyz.to(option) : torch::Tensor(),
           depth.numel() > 0 ? depth.to(option) : torch::Tensor(),
 
-          ray_sdf.numel() > 0 ? ray_sdf.to(option) : torch::Tensor()};
+          ray_sdf.numel() > 0 ? ray_sdf.to(option) : torch::Tensor(),
+          gt_normal_cam.numel() > 0 ? gt_normal_cam.to(option) : torch::Tensor()};
 }
 
 DepthSamples DepthSamples::contiguous() const {
@@ -162,15 +187,18 @@ DepthSamples DepthSamples::contiguous() const {
           xyz.numel() > 0 ? xyz.contiguous() : torch::Tensor(),
           depth.numel() > 0 ? depth.contiguous() : torch::Tensor(),
 
-          ray_sdf.numel() > 0 ? ray_sdf.contiguous() : torch::Tensor()};
+          ray_sdf.numel() > 0 ? ray_sdf.contiguous() : torch::Tensor(),
+          gt_normal_cam.numel() > 0 ? gt_normal_cam.contiguous()
+                                    : torch::Tensor()};
 }
 
 DepthSamples DepthSamples::clone() const {
   return {RaySamples::clone(), xyz.numel() > 0 ? xyz.clone() : torch::Tensor(),
           depth.numel() > 0 ? depth.clone() : torch::Tensor(),
 
-          ray_sdf.numel() > 0 ? ray_sdf.clone() : torch::Tensor()};
-}
+          ray_sdf.numel() > 0 ? ray_sdf.clone() : torch::Tensor(),
+          gt_normal_cam.numel() > 0 ? gt_normal_cam.clone() : torch::Tensor()}; 
+        };
 
 ColorSamples ColorSamples::index(
     const torch::ArrayRef<at::indexing::TensorIndex> &index) const {
@@ -294,6 +322,10 @@ void DepthSamplesVec::emplace_back(const DepthSamples &input) {
   if (input.ray_sdf.numel() > 0) {
     ray_sdf.emplace_back(input.ray_sdf);
   }
+
+  if(input.gt_normal_cam.numel() > 0) {
+    gt_normal_cam.emplace_back(input.gt_normal_cam);
+  }
 }
 
 void DepthSamplesVec::clear() {
@@ -301,6 +333,7 @@ void DepthSamplesVec::clear() {
   xyz.clear();
   depth.clear();
   ray_sdf.clear();
+  gt_normal_cam.clear();
 }
 
 void DepthSamplesVec::shrink_to_fit() {
@@ -308,6 +341,7 @@ void DepthSamplesVec::shrink_to_fit() {
   xyz.shrink_to_fit();
   depth.shrink_to_fit();
   ray_sdf.shrink_to_fit();
+  gt_normal_cam.shrink_to_fit();
 }
 
 void DepthSamplesVec::release() {
@@ -325,6 +359,9 @@ DepthSamples DepthSamplesVec::cat() const {
   }
   if (!ray_sdf.empty()) {
     out.ray_sdf = torch::cat(ray_sdf, 0);
+  }
+  if(!gt_normal_cam.empty()) {
+    out.gt_normal_cam = torch::cat(gt_normal_cam, 0);
   }
   return out;
 }

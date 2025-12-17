@@ -44,5 +44,46 @@ struct Fastlivo : Rosbag {
     sensor_.camera.cx = scale * sensor_.camera.cx;
     sensor_.camera.cy = scale * sensor_.camera.cy;
   }
+
+
+  void load_normals() {
+    std::filesystem::path normal_dir = bag_path_ / "normals"; // 你的法线文件夹
+    if (!std::filesystem::exists(normal_dir)) return;
+
+    std::vector<torch::Tensor> normal_list;
+    // 遍历训练用的 RGB 图片索引
+    size_t num_imgs = train_to_raw_map_ids_.empty() ? raw_color_filelists_.size() : train_to_raw_map_ids_.size();
+
+    for (size_t i = 0; i < num_imgs; ++i) {
+        int idx = train_to_raw_map_ids_.empty() ? i : train_to_raw_map_ids_[i];
+        std::filesystem::path rgb_path = raw_color_filelists_[idx];
+        
+        // 拼凑法线路径 (假设文件名相同，后缀为 .png)
+        std::filesystem::path normal_path = normal_dir / rgb_path.stem(); 
+        normal_path.replace_extension(".png");
+
+        cv::Mat n_img = cv::imread(normal_path.string());
+        if (n_img.empty()) {
+            n_img = cv::Mat::zeros(sensor_.camera.height, sensor_.camera.width, CV_8UC3);
+        } else {
+             // 强制 Resize 到和 RGB 一样大
+             if (n_img.rows != sensor_.camera.height || n_img.cols != sensor_.camera.width) {
+                 cv::resize(n_img, n_img, cv::Size(sensor_.camera.width, sensor_.camera.height));
+             }
+        }
+
+        // 转 Tensor 并归一化 [-1, 1]
+        torch::Tensor n_tensor = torch::from_blob(n_img.data, {n_img.rows, n_img.cols, 3}, torch::kByte);
+        n_tensor = n_tensor.permute({2, 0, 1}).to(torch::kFloat32); // [3, H, W]
+        n_tensor = (n_tensor / 127.5f) - 1.0f;
+        normal_list.push_back(n_tensor);
+    }
+    
+    if(!normal_list.empty()) {
+        train_normal_ = torch::stack(normal_list).to(device_); // [N, 3, H, W]
+    }
+  }
+
+
 };
 } // namespace dataparser

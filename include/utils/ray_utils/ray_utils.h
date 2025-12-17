@@ -44,6 +44,8 @@ struct DepthSamples : RaySamples {
 
   torch::Tensor ray_sdf; // [N,1]
 
+  torch::Tensor gt_normal_cam; // [N,3] optional
+
   DepthSamples
   index(const torch::ArrayRef<at::indexing::TensorIndex> &index) const;
 

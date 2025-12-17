@@ -71,6 +71,8 @@ public:
 
   bool save_image = false;
 
+  float k_normal_weight = 0.0f;
+
   void prefilter_data(const bool &export_img = false);
 
   bool build_occ_map();
